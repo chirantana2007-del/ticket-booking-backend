@@ -105,3 +105,61 @@ def test_expired_hold_makes_seat_available_again(client):
 
     # Another user can reserve it.
     assert reserve(client, 2, 10).status_code == 201
+
+
+# ---------- idempotency: repeating a request is safe ----------
+
+def test_repeated_pay_is_safe(client):
+    reservation_id = reserve(client, 1, 10).json()["reservation"]["reservation_id"]
+
+    first = pay(client, reservation_id)
+    second = pay(client, reservation_id)  # user double-clicks "Pay"
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["reservation"]["status"] == "CONFIRMED"
+    assert second.json()["reservation"]["reservation_id"] == reservation_id
+    assert seat_status(client, 10) == "BOOKED"
+
+
+def test_repeated_cancel_is_safe(client):
+    reservation_id = reserve(client, 1, 10).json()["reservation"]["reservation_id"]
+
+    first = client.post(f"/reservations/{reservation_id}/cancel")
+    second = client.post(f"/reservations/{reservation_id}/cancel")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["reservation"]["status"] == "CANCELLED"
+    assert seat_status(client, 10) == "AVAILABLE"
+
+
+def test_repeated_cancel_does_not_cancel_the_next_users_booking(client):
+    """A stale second cancel must not free a seat that someone else now holds."""
+    first_id = reserve(client, 1, 10).json()["reservation"]["reservation_id"]
+    client.post(f"/reservations/{first_id}/cancel")
+    assert reserve(client, 2, 10).status_code == 201  # user 2 holds seat 10
+
+    client.post(f"/reservations/{first_id}/cancel")  # user 1 repeats the cancel
+
+    assert seat_status(client, 10) == "HELD"  # user 2's hold is untouched
+
+
+# ---------- payment on a dead reservation is refused ----------
+
+def test_pay_on_expired_reservation_is_refused(client):
+    reservation_id = reserve(client, 1, 10).json()["reservation"]["reservation_id"]
+    expire_hold_in_db(reservation_id)
+
+    r = pay(client, reservation_id)
+    assert r.status_code == 409
+    assert seat_status(client, 10) == "AVAILABLE"
+
+
+def test_pay_on_cancelled_reservation_is_refused(client):
+    reservation_id = reserve(client, 1, 10).json()["reservation"]["reservation_id"]
+    client.post(f"/reservations/{reservation_id}/cancel")
+
+    r = pay(client, reservation_id)
+    assert r.status_code == 409
+    assert seat_status(client, 10) == "AVAILABLE"
